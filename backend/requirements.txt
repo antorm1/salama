@@ -4,3 +4,7 @@ pydantic-settings==2.5.2
 python-jose[cryptography]==3.3.0
 bcrypt==4.2.0
 python-multipart==0.0.12
+# ORM (works with both SQLite and PostgreSQL)
+sqlalchemy==2.0.36
+# Postgres driver — only needed when DATABASE_URL uses postgresql://
+psycopg[binary]==3.2.3

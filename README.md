@@ -21,9 +21,9 @@ Built for areas with poor connectivity: raise an **SOS**, share **local hazards*
 | Layer | Tech |
 |-------|------|
 | Frontend | React 18 + TypeScript + Vite + TailwindCSS + vite-plugin-pwa |
-| Backend | FastAPI (Python) + stdlib-sqlite3 (zero DB deps) |
-| Auth | JWT (python-jose) + bcrypt (passlib) |
-| Storage | SQLite (`salama.db`); swap to Postgres via `DATABASE_URL` |
+| Backend | FastAPI (Python) + **SQLAlchemy 2** (ORM) — SQLite by default, **PostgreSQL-ready** via `DATABASE_URL` |
+| Auth | JWT (python-jose) + bcrypt (bcrypt lib) |
+| Storage | SQLite (`salama.db`) for zero-config dev; **PostgreSQL** in production (set `DATABASE_URL`) |
 
 ## 📂 Project Structure
 
@@ -31,7 +31,7 @@ Built for areas with poor connectivity: raise an **SOS**, share **local hazards*
 salama/
 ├── backend/
 │   ├── main.py            # FastAPI app: auth, alerts, checkins, health
-│   ├── database.py        # SQLite connection, schema, admin seed
+│   ├── database.py        # SQLAlchemy engine, ORM models, session, admin seed
 │   ├── security.py        # password hashing + JWT
 │   ├── schemas.py         # Pydantic request/response models
 │   ├── config.py          # settings from .env
@@ -60,8 +60,12 @@ cd backend
 python -m venv .venv && source .venv/bin/activate   # or: python3 -m venv .venv
 pip install -r requirements.txt
 cp .env.example .env            # edit SECRET_KEY + SEED_ADMIN_PASSWORD
-python main.py                  # creates DB + seeds admin, serves on :8000
+python main.py                  # creates DB (SQLite) + seeds admin, serves on :8000
 ```
+
+> **Production / Postgres:** set `DATABASE_URL=postgresql+psycopg://user:pass@host:5432/salama`
+> in `.env`. Tables are created automatically on startup via `Base.metadata.create_all`.
+> Use a migration tool (Alembic) before scaling beyond the seed step.
 
 ### 2. Frontend (new terminal)
 ```bash

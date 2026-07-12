@@ -1,20 +1,24 @@
 """Salama Community Safety — FastAPI backend.
 
 Offline-first safety app: SOS alerts, local hazard map, neighbor check-ins.
+Database is driven by DATABASE_URL (SQLite by default, PostgreSQL in prod).
 Run with:  uvicorn main:app --reload --port 8000
 """
 from __future__ import annotations
 
-import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 import database
 import security
 from config import settings
+from database import Alert, CheckIn, User
 from schemas import (
     AlertCreate,
     AlertOut,
@@ -27,7 +31,20 @@ from schemas import (
     UserRegister,
 )
 
-app = FastAPI(title=settings.app_name, version="1.0.0")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+
+ALLOWED_CATEGORIES = {"sos", "hazard", "medical", "weather", "crime", "other"}
+ALLOWED_SEVERITIES = {"low", "medium", "high", "critical"}
+ALLOWED_STATUSES = {"active", "resolved"}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    database.init_db()
+    yield
+
+
+app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,12 +54,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
-
-ALLOWED_CATEGORIES = {"sos", "hazard", "medical", "weather", "crime", "other"}
-ALLOWED_SEVERITIES = {"low", "medium", "high", "critical"}
-ALLOWED_STATUSES = {"active", "resolved"}
-
 
 # --------------------------------------------------------------------------- #
 # Dependency helpers
@@ -51,19 +62,18 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(database.get_db)) -> User:
     payload = security.decode_access_token(token)
     if not payload or "sub" not in payload:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
-    with database.db_session() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (int(payload["sub"]),)).fetchone()
-    if not row:
+    user = db.get(User, int(payload["sub"]))
+    if not user:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
-    return dict(row)
+    return user
 
 
-def require_admin(user: dict = Depends(get_current_user)) -> dict:
-    if not user["is_admin"]:
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    if not user.is_admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin privileges required")
     return user
 
@@ -72,38 +82,38 @@ def require_admin(user: dict = Depends(get_current_user)) -> dict:
 # Auth
 # --------------------------------------------------------------------------- #
 @app.post("/auth/register", response_model=UserOut, status_code=201)
-def register(payload: UserRegister):
-    username = payload.username
+def register(payload: UserRegister, db: Session = Depends(database.get_db)):
+    username = payload.username.strip().lower()
     phone = security.normalize_phone(payload.phone)
     if not phone:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "A valid phone number is required")
-    with database.db_session() as conn:
-        exists = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
-        if exists:
-            raise HTTPException(status.HTTP_409_CONFLICT, "Username already registered")
-        cur = conn.execute(
-            """
-            INSERT INTO users (username, phone, display_name, hashed_password, is_admin, created_at)
-            VALUES (?, ?, ?, ?, 0, ?)
-            """,
-            (username, phone, payload.display_name or username, security.hash_password(payload.password), now_iso()),
-        )
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return _user_out(dict(row))
+    if db.scalar(select(User).where(User.username == username)):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Username already registered")
+    user = User(
+        username=username,
+        phone=phone,
+        display_name=payload.display_name or username,
+        hashed_password=security.hash_password(payload.password),
+        is_admin=False,
+        created_at=now_iso(),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _user_out(user)
 
 
 @app.post("/auth/token", response_model=Token)
-def login(payload: UserLogin):
-    with database.db_session() as conn:
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (payload.username.lower(),)).fetchone()
-    if not row or not security.verify_password(payload.password, row["hashed_password"]):
+def login(payload: UserLogin, db: Session = Depends(database.get_db)):
+    user = db.scalar(select(User).where(User.username == payload.username.strip().lower()))
+    if not user or not security.verify_password(payload.password, user.hashed_password):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect username or password")
-    token = security.create_access_token(row["id"], bool(row["is_admin"]))
+    token = security.create_access_token(user.id, bool(user.is_admin))
     return Token(access_token=token)
 
 
 @app.get("/auth/me", response_model=UserOut)
-def me(user: dict = Depends(get_current_user)):
+def me(user: User = Depends(get_current_user)):
     return _user_out(user)
 
 
@@ -111,7 +121,7 @@ def me(user: dict = Depends(get_current_user)):
 # Alerts
 # --------------------------------------------------------------------------- #
 @app.post("/alerts", response_model=AlertOut, status_code=201)
-def create_alert(payload: AlertCreate, user: dict = Depends(get_current_user)):
+def create_alert(payload: AlertCreate, user: User = Depends(get_current_user), db: Session = Depends(database.get_db)):
     cat = (payload.category or "other").lower()
     sev = (payload.severity or "medium").lower()
     if cat not in ALLOWED_CATEGORIES:
@@ -119,17 +129,22 @@ def create_alert(payload: AlertCreate, user: dict = Depends(get_current_user)):
     if sev not in ALLOWED_SEVERITIES:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"severity must be one of {sorted(ALLOWED_SEVERITIES)}")
     ts = now_iso()
-    with database.db_session() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO alerts (author_id, category, severity, title, description, lat, lng, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
-            """,
-            (user["id"], cat, sev, payload.title.strip(), payload.description, payload.lat, payload.lng, ts, ts),
-        )
-        row = conn.execute("SELECT * FROM alerts WHERE id = ?", (cur.lastrowid,)).fetchone()
-        author = conn.execute("SELECT display_name, username FROM users WHERE id = ?", (user["id"],)).fetchone()
-    return _alert_out(dict(row), author)
+    alert = Alert(
+        author_id=user.id,
+        category=cat,
+        severity=sev,
+        title=payload.title.strip(),
+        description=payload.description,
+        lat=payload.lat,
+        lng=payload.lng,
+        status="active",
+        created_at=ts,
+        updated_at=ts,
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    return _alert_out(alert)
 
 
 @app.get("/alerts", response_model=list[AlertOut])
@@ -137,115 +152,85 @@ def list_alerts(
     status_filter: str = Query("active", alias="status"),
     category: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
 ):
     if status_filter not in (ALLOWED_STATUSES | {"all"}):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "status must be active|resolved|all")
-    clauses = []
-    params: list = []
+    stmt = select(Alert).order_by(Alert.created_at.desc())
     if status_filter != "all":
-        clauses.append("a.status = ?")
-        params.append(status_filter)
+        stmt = stmt.where(Alert.status == status_filter)
     if category:
-        clauses.append("a.category = ?")
-        params.append(category.lower())
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
-        SELECT a.*, u.display_name AS author_name
-        FROM alerts a JOIN users u ON u.id = a.author_id
-        {where}
-        ORDER BY a.created_at DESC
-        LIMIT ?
-    """
-    params.append(limit)
-    with database.db_session() as conn:
-        rows = conn.execute(sql, params).fetchall()
-    return [_alert_out(dict(r), None) for r in rows]
+        stmt = stmt.where(Alert.category == category.lower())
+    stmt = stmt.limit(limit)
+    alerts = db.scalars(stmt).all()
+    return [_alert_out(a) for a in alerts]
 
 
 @app.get("/alerts/{alert_id}", response_model=AlertOut)
-def get_alert(alert_id: int, user: dict = Depends(get_current_user)):
-    with database.db_session() as conn:
-        row = conn.execute(
-            "SELECT a.*, u.display_name AS author_name FROM alerts a JOIN users u ON u.id=a.author_id WHERE a.id = ?",
-            (alert_id,),
-        ).fetchone()
-    if not row:
+def get_alert(alert_id: int, user: User = Depends(get_current_user), db: Session = Depends(database.get_db)):
+    alert = db.get(Alert, alert_id)
+    if not alert:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found")
-    return _alert_out(dict(row), None)
+    return _alert_out(alert)
 
 
 @app.patch("/alerts/{alert_id}", response_model=AlertOut)
-def update_alert(alert_id: int, payload: AlertUpdate, user: dict = Depends(get_current_user)):
+def update_alert(alert_id: int, payload: AlertUpdate, user: User = Depends(get_current_user), db: Session = Depends(database.get_db)):
     if payload.status not in ALLOWED_STATUSES:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "status must be active|resolved")
-    with database.db_session() as conn:
-        row = conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
-        if not row:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found")
-        if not user["is_admin"] and row["author_id"] != user["id"]:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed to update this alert")
-        conn.execute(
-            "UPDATE alerts SET status = ?, updated_at = ? WHERE id = ?",
-            (payload.status, now_iso(), alert_id),
-        )
-        row = conn.execute(
-            "SELECT a.*, u.display_name AS author_name FROM alerts a JOIN users u ON u.id=a.author_id WHERE a.id = ?",
-            (alert_id,),
-        ).fetchone()
-        author = conn.execute("SELECT display_name FROM users WHERE id = ?", (row["author_id"],)).fetchone()
-    return _alert_out(dict(row), author)
+    alert = db.get(Alert, alert_id)
+    if not alert:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found")
+    if not user.is_admin and alert.author_id != user.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed to update this alert")
+    alert.status = payload.status
+    alert.updated_at = now_iso()
+    db.commit()
+    db.refresh(alert)
+    return _alert_out(alert)
 
 
 @app.delete("/alerts/{alert_id}", status_code=204)
-def delete_alert(alert_id: int, user: dict = Depends(require_admin)):
-    with database.db_session() as conn:
-        res = conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
-        if res.rowcount == 0:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found")
+def delete_alert(alert_id: int, user: User = Depends(require_admin), db: Session = Depends(database.get_db)):
+    alert = db.get(Alert, alert_id)
+    if not alert:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found")
+    db.delete(alert)
+    db.commit()
 
 
 # --------------------------------------------------------------------------- #
 # Check-ins
 # --------------------------------------------------------------------------- #
 @app.post("/checkins", response_model=CheckInOut, status_code=201)
-def create_checkin(payload: CheckInCreate, user: dict = Depends(get_current_user)):
-    ts = now_iso()
-    with database.db_session() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO checkins (user_id, note, lat, lng, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (user["id"], payload.note, payload.lat, payload.lng, ts),
-        )
-        row = conn.execute("SELECT * FROM checkins WHERE id = ?", (cur.lastrowid,)).fetchone()
-        author = conn.execute("SELECT display_name, username FROM users WHERE id = ?", (user["id"],)).fetchone()
-    return _checkin_out(dict(row), author)
+def create_checkin(payload: CheckInCreate, user: User = Depends(get_current_user), db: Session = Depends(database.get_db)):
+    ci = CheckIn(
+        user_id=user.id,
+        note=payload.note,
+        lat=payload.lat,
+        lng=payload.lng,
+        created_at=now_iso(),
+    )
+    db.add(ci)
+    db.commit()
+    db.refresh(ci)
+    return _checkin_out(ci)
 
 
 @app.get("/checkins", response_model=list[CheckInOut])
 def list_checkins(
     limit: int = Query(100, ge=1, le=500),
     only_mine: bool = Query(False),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(database.get_db),
 ):
+    stmt = select(CheckIn).order_by(CheckIn.created_at.desc())
     if only_mine:
-        params: list = [user["id"], limit]
-        where = "WHERE c.user_id = ?"
-    else:
-        params = [limit]
-        where = ""
-    sql = f"""
-        SELECT c.*, u.display_name AS user_name
-        FROM checkins c JOIN users u ON u.id = c.user_id
-        {where}
-        ORDER BY c.created_at DESC
-        LIMIT ?
-    """
-    with database.db_session() as conn:
-        rows = conn.execute(sql, params).fetchall()
-    return [_checkin_out(dict(r), None) for r in rows]
+        stmt = stmt.where(CheckIn.user_id == user.id)
+    stmt = stmt.limit(limit)
+    items = db.scalars(stmt).all()
+    return [_checkin_out(c) for c in items]
 
 
 # --------------------------------------------------------------------------- #
@@ -259,54 +244,44 @@ def health():
 # --------------------------------------------------------------------------- #
 # Serialization helpers
 # --------------------------------------------------------------------------- #
-def _user_out(row: dict) -> UserOut:
+def _user_out(u: User) -> UserOut:
     return UserOut(
-        id=row["id"],
-        username=row["username"],
-        phone=row["phone"],
-        display_name=row["display_name"],
-        is_admin=bool(row["is_admin"]),
-        created_at=row["created_at"],
+        id=u.id,
+        username=u.username,
+        phone=u.phone,
+        display_name=u.display_name,
+        is_admin=bool(u.is_admin),
+        created_at=u.created_at,
     )
 
 
-def _alert_out(row: dict, author: sqlite3.Row | None) -> AlertOut:
-    name = row.get("author_name") or (author["display_name"] if author else "unknown")
+def _alert_out(a: Alert) -> AlertOut:
     return AlertOut(
-        id=row["id"],
-        author_id=row["author_id"],
-        author_name=name,
-        category=row["category"],
-        severity=row["severity"],
-        title=row["title"],
-        description=row["description"],
-        lat=row["lat"],
-        lng=row["lng"],
-        status=row["status"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        id=a.id,
+        author_id=a.author_id,
+        author_name=a.author.display_name if a.author else "unknown",
+        category=a.category,
+        severity=a.severity,
+        title=a.title,
+        description=a.description,
+        lat=a.lat,
+        lng=a.lng,
+        status=a.status,
+        created_at=a.created_at,
+        updated_at=a.updated_at,
     )
 
 
-def _checkin_out(row: dict, author: sqlite3.Row | None) -> CheckInOut:
-    name = row.get("user_name") or (author["display_name"] if author else "unknown")
+def _checkin_out(c: CheckIn) -> CheckInOut:
     return CheckInOut(
-        id=row["id"],
-        user_id=row["user_id"],
-        user_name=name,
-        note=row["note"],
-        lat=row["lat"],
-        lng=row["lng"],
-        created_at=row["created_at"],
+        id=c.id,
+        user_id=c.user_id,
+        user_name=c.user.display_name if c.user else "unknown",
+        note=c.note,
+        lat=c.lat,
+        lng=c.lng,
+        created_at=c.created_at,
     )
-
-
-# --------------------------------------------------------------------------- #
-# Startup
-# --------------------------------------------------------------------------- #
-@app.on_event("startup")
-def _startup():
-    database.init_db()
 
 
 if __name__ == "__main__":
